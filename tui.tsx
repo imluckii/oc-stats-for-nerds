@@ -5,18 +5,18 @@ import { createSignal, Show, onCleanup, createMemo } from "solid-js"
 const PLUGIN_ID = "opencode-stats-for-nerds"
 
 // ── Config ──
-// All stats can be individually toggled via tui.json:
-//   "plugin": [["opencode-stats-for-nerds", { "show": { "speed": false } }]]
-// Defaults: everything shown.
 
 interface StatVisibility {
   tokens: boolean
   cache: boolean
-  total: boolean
+  context: boolean
   cost: boolean
+  genTime: boolean
+  thinkTime: boolean
   ttft: boolean
   speed: boolean
-  sessionTime: boolean
+  activity: boolean
+  changes: boolean
   model: boolean
 }
 
@@ -27,11 +27,14 @@ interface PluginOptions {
 const DEFAULT_VISIBILITY: StatVisibility = {
   tokens: true,
   cache: true,
-  total: true,
+  context: true,
   cost: true,
+  genTime: true,
+  thinkTime: false,
   ttft: true,
   speed: true,
-  sessionTime: true,
+  activity: false,
+  changes: true,
   model: true,
 }
 
@@ -67,12 +70,13 @@ function pad(str: string, width: number): string {
 
 interface PartData {
   type: string
-  time?: number
+  time?: { start?: number; end?: number }
 }
 
 interface MessageInfo {
   role: string
   modelID?: string
+  providerID?: string
   cost?: number
   tokens?: {
     total?: number
@@ -89,24 +93,63 @@ interface RawMessage {
   parts?: PartData[]
 }
 
+interface FileChange {
+  file: string
+  additions: number
+  deletions: number
+}
+
 interface Stats {
+  // cumulative tokens
   totalInput: number
   totalOutput: number
   totalReasoning: number
   totalCacheRead: number
   totalCacheWrite: number
-  grandTotal: number
+  // context window (last message, NOT cumulative)
+  contextUsed: number
+  contextLimit: number
+  contextPercent: number
+  // cost
   totalCost: number
-  turnCount: number
-  model: string
-  // latest turn
+  // timing
+  activeTimeMs: number
+  thinkTimeMs: number
   lastTtft: number | null
   lastTps: number
-  // session active generation time (sum of all assistant durations)
-  activeTimeMs: number
+  // activity
+  stepCount: number
+  toolCallCount: number
+  // files
+  fileChanges: FileChange[]
+  totalAdditions: number
+  totalDeletions: number
+  // model
+  model: string
+  providerID: string
+  turnCount: number
 }
 
-function computeStats(messages: RawMessage[], sessionCost: number): Stats | null {
+function findContextLimit(
+  api: Parameters<TuiPlugin>[0],
+  modelID: string | undefined,
+  providerID: string | undefined,
+): number {
+  if (!modelID || !providerID) return 0
+  const providers = api.state.provider
+  const provider = providers.find((p: any) => p.id === providerID)
+  if (!provider) return 0
+  const model = (provider as any).models?.[modelID]
+  if (!model) return 0
+  return model.limit?.context || 0
+}
+
+function computeStats(
+  messages: RawMessage[],
+  sessionCost: number,
+  fileChanges: FileChange[],
+  contextLimit: number,
+): Stats | null {
   const assistants = messages
     .filter((m) => m.info?.role === "assistant" && m.info?.tokens)
     .map((m) => m)
@@ -120,6 +163,9 @@ function computeStats(messages: RawMessage[], sessionCost: number): Stats | null
   let totalCacheWrite = 0
   let totalCost = 0
   let activeTimeMs = 0
+  let thinkTimeMs = 0
+  let stepCount = 0
+  let toolCallCount = 0
 
   for (const m of assistants) {
     const tk = m.info.tokens!
@@ -130,31 +176,50 @@ function computeStats(messages: RawMessage[], sessionCost: number): Stats | null
     totalCacheWrite += tk.cache?.write || 0
     totalCost += m.info.cost || 0
 
-    // Sum actual generation durations
     if (m.info.time?.created && m.info.time?.completed) {
       activeTimeMs += m.info.time.completed - m.info.time.created
     }
-  }
 
-  const last = assistants[assistants.length - 1]
-  const lastInfo = last.info
-  const lastTk = lastInfo.tokens!
-
-  // TTFT: created → first content part
-  let lastTtft: number | null = null
-  if (lastInfo.time?.created && last.parts) {
-    for (const p of last.parts) {
-      if ((p.type === "text" || p.type === "reasoning") && p.time) {
-        const delta = p.time - lastInfo.time.created
-        if (delta > 0) {
-          lastTtft = delta / 1000
-          break
+    // Count parts
+    if (m.parts) {
+      for (const p of m.parts) {
+        if (p.type === "step-start") stepCount++
+        if (p.type === "tool") toolCallCount++
+        if (p.type === "reasoning" && p.time?.start && p.time?.end) {
+          thinkTimeMs += p.time.end - p.time.start
         }
       }
     }
   }
 
-  // Speed: latest turn only
+  // Context window = last message's full token set
+  const last = assistants[assistants.length - 1]
+  const lastInfo = last.info
+  const lastTk = lastInfo.tokens!
+  const contextUsed =
+    (lastTk.input || 0) + (lastTk.output || 0) + (lastTk.reasoning || 0) +
+    (lastTk.cache?.read || 0) + (lastTk.cache?.write || 0)
+
+  const contextPercent = contextLimit > 0 ? Math.round((contextUsed / contextLimit) * 100) : 0
+
+  // TTFT
+  let lastTtft: number | null = null
+  if (lastInfo.time?.created && last.parts) {
+    for (const p of last.parts) {
+      if ((p.type === "text" || p.type === "reasoning") && p.time) {
+        const t = p.time.start || (p.time as any)
+        if (typeof t === "number") {
+          const delta = t - lastInfo.time.created
+          if (delta > 0) {
+            lastTtft = delta / 1000
+            break
+          }
+        }
+      }
+    }
+  }
+
+  // Speed
   let lastTps = 0
   if (lastInfo.time?.created && lastInfo.time?.completed) {
     const durSec = (lastInfo.time.completed - lastInfo.time.created) / 1000
@@ -163,33 +228,37 @@ function computeStats(messages: RawMessage[], sessionCost: number): Stats | null
     }
   }
 
+  // Files
+  let totalAdditions = 0
+  let totalDeletions = 0
+  for (const f of fileChanges) {
+    totalAdditions += f.additions || 0
+    totalDeletions += f.deletions || 0
+  }
+
   return {
     totalInput,
     totalOutput,
     totalReasoning,
     totalCacheRead,
     totalCacheWrite,
-    grandTotal:
-      totalInput + totalOutput + totalReasoning + totalCacheRead + totalCacheWrite,
+    contextUsed,
+    contextLimit,
+    contextPercent,
     totalCost: sessionCost || totalCost,
-    turnCount: assistants.length,
-    model: lastInfo.modelID || "unknown",
+    activeTimeMs,
+    thinkTimeMs,
     lastTtft,
     lastTps,
-    activeTimeMs,
+    stepCount,
+    toolCallCount,
+    fileChanges,
+    totalAdditions,
+    totalDeletions,
+    model: lastInfo.modelID || "unknown",
+    providerID: lastInfo.providerID || "",
+    turnCount: assistants.length,
   }
-}
-
-// ── Row component ──
-
-function Row(props: { label: string; children: any; theme: any; width: number }) {
-  const t = () => props.theme
-  return (
-    <box flexDirection="row">
-      <text style={{ fg: t().textMuted }}>{pad("  " + props.label, props.width)}</text>
-      {props.children}
-    </box>
-  )
 }
 
 // ── View ──
@@ -219,12 +288,32 @@ function StatsView(props: {
     tick()
     const msgs = props.api.state.session.messages(props.sessionID) as unknown as RawMessage[] || []
     const session = props.api.state.session.get(props.sessionID) as any
-    return computeStats(msgs, session?.cost ?? 0)
+
+    // Find model info for context limit
+    let ctxLimit = 0
+    const lastAssistant = [...msgs].reverse().find((m) => m.info?.role === "assistant")
+    if (lastAssistant) {
+      ctxLimit = findContextLimit(
+        props.api,
+        lastAssistant.info.modelID,
+        lastAssistant.info.providerID,
+      )
+    }
+
+    const diff = props.api.state.session.diff(props.sessionID) as unknown as FileChange[] || []
+    return computeStats(msgs, session?.cost ?? 0, diff, ctxLimit)
   })
 
   const v = props.visibility
   const t = () => theme()
   const W = 13
+
+  // Context percent color
+  const ctxColor = (pct: number) => {
+    if (pct > 80) return t().error
+    if (pct > 50) return t().warning
+    return t().text
+  }
 
   return (
     <box flexDirection="column" paddingTop={1} paddingBottom={1}>
@@ -241,82 +330,84 @@ function StatsView(props: {
           {(s) => (
             <box flexDirection="column">
 
-              {/* Tokens */}
+              {/* ── Tokens ── */}
               <Show when={v.tokens}>
-                <Row label="Tokens" theme={t()} width={W}>
-                  <text style={{ fg: t().text }}>
-                    {"  " + fmt(s().totalInput) + " in"}
-                  </text>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Tokens", W)}</text>
+                  <text style={{ fg: t().text }}>{"  " + fmt(s().totalInput) + " in"}</text>
                   <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                  <text style={{ fg: t().text }}>
-                    {fmt(s().totalOutput) + " out"}
-                  </text>
+                  <text style={{ fg: t().text }}>{fmt(s().totalOutput) + " out"}</text>
                   <Show when={s().totalReasoning > 0}>
                     <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                    <text style={{ fg: t().text }}>
-                      {fmt(s().totalReasoning) + " thinking"}
-                    </text>
+                    <text style={{ fg: t().text }}>{fmt(s().totalReasoning) + " thinking"}</text>
                   </Show>
-                </Row>
+                </box>
               </Show>
 
-              {/* Cache */}
+              {/* ── Cache ── */}
               <Show when={v.cache && (s().totalCacheRead > 0 || s().totalCacheWrite > 0)}>
-                <Row label="Cached" theme={t()} width={W}>
-                  <text style={{ fg: t().text }}>
-                    {"  " + fmt(s().totalCacheRead) + " read"}
-                  </text>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Cached", W)}</text>
+                  <text style={{ fg: t().text }}>{"  " + fmt(s().totalCacheRead) + " read"}</text>
                   <Show when={s().totalCacheWrite > 0}>
                     <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                    <text style={{ fg: t().text }}>
-                      {fmt(s().totalCacheWrite) + " write"}
-                    </text>
+                    <text style={{ fg: t().text }}>{fmt(s().totalCacheWrite) + " write"}</text>
                   </Show>
-                </Row>
+                </box>
               </Show>
 
-              {/* Total */}
-              <Show when={v.total}>
-                <Row label="Total" theme={t()} width={W}>
-                  <text style={{ fg: t().text }}>
-                    {"  " + fmt(s().grandTotal)}
+              {/* ── Context ── */}
+              <Show when={v.context && s().contextLimit > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Context", W)}</text>
+                  <text style={{ fg: ctxColor(s().contextPercent) }}>
+                    {"  " + fmt(s().contextUsed) + " / " + fmt(s().contextLimit)}
                   </text>
-                </Row>
+                  <text style={{ fg: t().textMuted }}>
+                    {" (" + s().contextPercent + "%)"}
+                  </text>
+                </box>
               </Show>
 
-              {/* Separator */}
+              {/* ── Separator ── */}
               <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
 
-              {/* Cost */}
+              {/* ── Cost ── */}
               <Show when={v.cost}>
-                <Row label="Cost" theme={t()} width={W}>
-                  <text style={{ fg: t().text }}>
-                    {"  $" + s().totalCost.toFixed(4)}
-                  </text>
-                </Row>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Cost", W)}</text>
+                  <text style={{ fg: t().text }}>{"  $" + s().totalCost.toFixed(4)}</text>
+                </box>
               </Show>
 
-              {/* Session Time */}
-              <Show when={v.sessionTime && s().activeTimeMs > 0}>
-                <Row label="Gen Time" theme={t()} width={W}>
-                  <text style={{ fg: t().text }}>
-                    {"  " + fmtDuration(s().activeTimeMs)}
-                  </text>
-                </Row>
+              {/* ── Gen Time ── */}
+              <Show when={v.genTime && s().activeTimeMs > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Gen Time", W)}</text>
+                  <text style={{ fg: t().text }}>{"  " + fmtDuration(s().activeTimeMs)}</text>
+                </box>
               </Show>
 
-              {/* TTFT */}
+              {/* ── Think Time ── */}
+              <Show when={v.thinkTime && s().thinkTimeMs > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Think Time", W)}</text>
+                  <text style={{ fg: t().text }}>{"  " + fmtDuration(s().thinkTimeMs)}</text>
+                </box>
+              </Show>
+
+              {/* ── TTFT ── */}
               <Show when={v.ttft && s().lastTtft !== null}>
-                <Row label="TTFT" theme={t()} width={W}>
-                  <text style={{ fg: t().text }}>
-                    {"  " + s().lastTtft!.toFixed(2) + "s"}
-                  </text>
-                </Row>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  TTFT", W)}</text>
+                  <text style={{ fg: t().text }}>{"  " + s().lastTtft!.toFixed(2) + "s"}</text>
+                </box>
               </Show>
 
-              {/* Speed */}
+              {/* ── Speed ── */}
               <Show when={v.speed && s().lastTps > 0}>
-                <Row label="Speed" theme={t()} width={W}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Speed", W)}</text>
                   <text
                     style={{
                       fg: s().lastTps > 50 ? t().success : s().lastTps > 15 ? t().warning : t().textMuted,
@@ -324,14 +415,45 @@ function StatsView(props: {
                   >
                     {"  " + fmtTps(s().lastTps) + " tok/s"}
                   </text>
-                </Row>
+                </box>
               </Show>
 
-              {/* Model */}
+              {/* ── Separator ── */}
+              <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
+
+              {/* ── Activity ── */}
+              <Show when={v.activity && (s().stepCount > 0 || s().toolCallCount > 0)}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Activity", W)}</text>
+                  <text style={{ fg: t().text }}>
+                    {"  " + s().stepCount + " steps"}
+                  </text>
+                  <Show when={s().toolCallCount > 0}>
+                    <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
+                    <text style={{ fg: t().text }}>{s().toolCallCount + " tools"}</text>
+                  </Show>
+                </box>
+              </Show>
+
+              {/* ── Changes ── */}
+              <Show when={v.changes && s().fileChanges.length > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Changes", W)}</text>
+                  <text style={{ fg: t().success }}>{"  +" + s().totalAdditions}</text>
+                  <text style={{ fg: t().textMuted }}>{" "}</text>
+                  <text style={{ fg: t().error }}>{"-" + s().totalDeletions}</text>
+                  <text style={{ fg: t().textMuted }}>
+                    {" \u00B7 " + s().fileChanges.length + " files"}
+                  </text>
+                </box>
+              </Show>
+
+              {/* ── Model ── */}
               <Show when={v.model}>
-                <Row label="Model" theme={t()} width={W}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Model", W)}</text>
                   <text style={{ fg: t().textMuted }}>{"  " + s().model}</text>
-                </Row>
+                </box>
               </Show>
 
             </box>

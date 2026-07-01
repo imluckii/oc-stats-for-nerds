@@ -1,6 +1,6 @@
 # opencode-stats-for-nerds
 
-OpenCode TUI plugin that shows token usage, generation speed, and cost stats in the sidebar after each response.
+OpenCode TUI plugin that shows token usage, context window, generation speed, cost, and file changes in the sidebar after each response.
 
 ## Install
 
@@ -16,31 +16,38 @@ Restart OpenCode. A **Stats for Nerds** panel appears in the right sidebar.
 ▼ Stats for Nerds
   Tokens       13.4k in · 1.2k out · 2.0k thinking
   Cached       3.8k read · 2.7k write
-  Total        23.2k
+  Context      23.2k / 200k (11%)
   ────────────────
   Cost         $0.0070
   Gen Time     2m 14s
   TTFT         1.35s
   Speed        42.3 tok/s
+  ────────────────
+  Changes      +234 -56 · 5 files
   Model        claude-sonnet-4
 ```
 
+Click the header to collapse/expand.
+
+### Stats reference
+
 | Stat | Scope | Description |
 |------|-------|-------------|
-| **Tokens** | Cumulative | Input, output, and reasoning tokens across all turns |
+| **Tokens** | Cumulative | Input, output, and thinking tokens across all turns |
 | **Cached** | Cumulative | Prompt cache hits (read = reused, write = newly cached) |
-| **Total** | Cumulative | Sum of all token types (current context window size) |
+| **Context** | Current | Context window used vs model limit, with percentage |
 | **Cost** | Cumulative | Total session cost at provider rates |
-| **Gen Time** | Cumulative | Total time the model spent generating (sum of all response durations) |
-| **TTFT** | Last response | Time-to-first-token — how long before the model started outputting |
-| **Speed** | Last response | Output tokens per second for the latest response |
-| **Model** | Last response | Model ID used for the latest response |
-
-Click the header to collapse/expand.
+| **Gen Time** | Cumulative | Total time the model spent generating |
+| **Think Time** | Cumulative | Total time the model spent reasoning (off by default) |
+| **TTFT** | Last response | Time-to-first-token |
+| **Speed** | Last response | Output tokens per second |
+| **Activity** | Cumulative | Tool-call steps and invocations (off by default) |
+| **Changes** | Session | File additions, deletions, and count |
+| **Model** | Last response | Model ID |
 
 ## Configuration
 
-Disable any stat you don't want via your `tui.json`:
+Disable any stat via `tui.json`:
 
 ```json
 {
@@ -49,7 +56,7 @@ Disable any stat you don't want via your `tui.json`:
     ["opencode-stats-for-nerds", {
       "show": {
         "cache": false,
-        "sessionTime": false,
+        "activity": true,
         "model": false
       }
     }]
@@ -57,27 +64,21 @@ Disable any stat you don't want via your `tui.json`:
 }
 ```
 
-All options default to `true`. Available toggles:
+All options default to `true` except `thinkTime` and `activity`.
 
 | Key | Default | Controls |
 |-----|---------|----------|
 | `tokens` | `true` | Input/output/thinking row |
 | `cache` | `true` | Cache read/write row |
-| `total` | `true` | Grand total token count |
+| `context` | `true` | Context window used / limit (%) |
 | `cost` | `true` | Session cost |
+| `genTime` | `true` | Total generation time |
+| `thinkTime` | `false` | Total reasoning time |
 | `ttft` | `true` | Time-to-first-token |
 | `speed` | `true` | Tokens per second |
-| `sessionTime` | `true` | Total generation time |
+| `activity` | `false` | Steps and tool calls |
+| `changes` | `true` | File additions/deletions |
 | `model` | `true` | Model name |
-
-## How it works
-
-- Hooks into the `sidebar_content` TUI slot via `@opentui/solid`
-- Reads token/cost data from `api.state.session.messages()`
-- TTFT computed from message creation time to first content part
-- Speed computed from output tokens / generation duration
-- Updates after each assistant response completes
-- Handles multi-turn sessions, multiple models, and reasoning tokens
 
 ## Requirements
 
