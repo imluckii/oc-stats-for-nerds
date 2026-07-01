@@ -4,7 +4,7 @@ import type { Plugin } from "@opencode-ai/plugin"
  * oc-stats-for-nerds — server plugin
  *
  * Event hooks that run in both TUI and headless/serve mode.
- * Handles session.idle → logs final stats.
+ * On session.idle, fetches final stats and logs them.
  */
 
 const StatsServerPlugin: Plugin = async ({ client }) => {
@@ -22,7 +22,7 @@ const StatsServerPlugin: Plugin = async ({ client }) => {
 
         const messagesRes = await client.session.messages({ path: { id: sessionId } })
         const messages = messagesRes.data || []
-        const stats = aggregateStats(messages, session)
+        const stats = aggregateStats(messages as any, session as any)
         if (stats.totalOutput === 0) return
 
         await client.app.log({
@@ -41,15 +41,43 @@ export default { server: StatsServerPlugin }
 
 // ── Shared stats logic ──
 
-interface TokenInfo { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
-interface SessionData { id: string; cost?: number; tokens?: TokenInfo; model?: { id: string }; time?: { created?: number; updated?: number } }
-interface MessageInfo { role: string; modelID?: string; cost?: number; tokens?: Partial<TokenInfo>; time?: { created?: number; completed?: number } }
-interface SessionMessage { info: MessageInfo; parts: unknown[] }
+interface TokenInfo {
+  input: number
+  output: number
+  reasoning: number
+  cache: { read: number; write: number }
+}
+interface SessionData {
+  id: string
+  cost?: number
+  tokens?: TokenInfo
+  model?: { id: string }
+  time?: { created?: number; updated?: number }
+}
+interface MessageInfo {
+  role: string
+  modelID?: string
+  cost?: number
+  tokens?: Partial<TokenInfo>
+  time?: { created?: number; completed?: number }
+}
+interface SessionMessage {
+  info: MessageInfo
+  parts: unknown[]
+}
 
 export interface AggregatedStats {
-  totalOutput: number; totalInput: number; totalReasoning: number; totalCost: number
-  cacheRead: number; totalGenSec: number; firstTokenSec: number | null
-  model: string; msgCount: number; tps: number; wallSec: number
+  totalOutput: number
+  totalInput: number
+  totalReasoning: number
+  totalCost: number
+  cacheRead: number
+  totalGenSec: number
+  firstTokenSec: number | null
+  model: string
+  msgCount: number
+  tps: number
+  wallSec: number
 }
 
 function durSec(t?: { created?: number; completed?: number }): number {
@@ -57,27 +85,51 @@ function durSec(t?: { created?: number; completed?: number }): number {
   return Math.max(0, (t.completed - t.created) / 1000)
 }
 
-export function aggregateStats(messages: SessionMessage[], session: SessionData): AggregatedStats {
-  let totalOutput = 0, totalInput = 0, totalReasoning = 0, totalCost = 0
-  let totalGenSec = 0, firstTokenSec: number | null = null
+export function aggregateStats(
+  messages: SessionMessage[],
+  session: SessionData,
+): AggregatedStats {
+  let totalOutput = 0,
+    totalInput = 0,
+    totalReasoning = 0,
+    totalCost = 0
+  let totalGenSec = 0,
+    firstTokenSec: number | null = null
   let model = "?"
 
   const asst = messages.filter((m) => m.info.role === "assistant")
   asst.forEach((m, i) => {
     const tk = m.info.tokens || {}
-    totalOutput += tk.output || 0; totalInput += tk.input || 0
-    totalReasoning += tk.reasoning || 0; totalCost += m.info.cost || 0
-    const gs = durSec(m.info.time); totalGenSec += gs
+    totalOutput += tk.output || 0
+    totalInput += tk.input || 0
+    totalReasoning += tk.reasoning || 0
+    totalCost += m.info.cost || 0
+    const gs = durSec(m.info.time)
+    totalGenSec += gs
     if (i === 0 && gs > 0) firstTokenSec = gs
     if (model === "?" && m.info.modelID) model = m.info.modelID
   })
 
-  const wallSec = session.time?.created && session.time?.updated
-    ? Math.max(0, (session.time.updated - session.time.created) / 1000) : 0
+  const wallSec =
+    session.time?.created && session.time?.updated
+      ? Math.max(0, (session.time.updated - session.time.created) / 1000)
+      : 0
   const tps = totalGenSec > 0 ? totalOutput / totalGenSec : 0
   const cacheRead = session.tokens?.cache?.read || 0
 
-  return { totalOutput, totalInput, totalReasoning, totalCost, cacheRead, totalGenSec, firstTokenSec, model, msgCount: asst.length, tps, wallSec }
+  return {
+    totalOutput,
+    totalInput,
+    totalReasoning,
+    totalCost,
+    cacheRead,
+    totalGenSec,
+    firstTokenSec,
+    model,
+    msgCount: asst.length,
+    tps,
+    wallSec,
+  }
 }
 
 export function formatStatsBlock(s: AggregatedStats): string {
@@ -97,9 +149,15 @@ export function formatStatsInline(s: AggregatedStats): string {
   let parts: string[] = []
   parts.push(`${s.tps.toFixed(0)} tok/s`)
   if (s.firstTokenSec !== null) parts.push(`TTFT ${s.firstTokenSec.toFixed(1)}s`)
-  parts.push(`${s.totalInput.toLocaleString()} in`)
-  parts.push(`${s.totalOutput.toLocaleString()} out`)
-  if (s.cacheRead) parts.push(`${(s.cacheRead / 1000).toFixed(0)}k cache`)
+  parts.push(`${fmt(s.totalInput)} in`)
+  parts.push(`${fmt(s.totalOutput)} out`)
+  if (s.cacheRead) parts.push(`${fmt(s.cacheRead)} cached`)
   parts.push(`$${s.totalCost.toFixed(4)}`)
   return parts.join(" · ")
+}
+
+export function fmt(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return n.toString()
 }
