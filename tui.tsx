@@ -38,40 +38,11 @@ const DEFAULT_VISIBILITY: StatVisibility = {
   model: true,
 }
 
-function extractShow(obj: unknown): Partial<StatVisibility> | null {
-  if (!obj || typeof obj !== "object") return null
-  const show = (obj as PluginOptions).show
-  if (!show || typeof show !== "object") return null
-  return show as Partial<StatVisibility>
-}
-
-function resolveVisibility(
-  options: unknown,
-  tuiConfig: { plugin?: ReadonlyArray<string | readonly [string, unknown]> } | undefined,
-): StatVisibility {
-  // 1. Try options passed directly to the plugin function
-  const direct = extractShow(options)
-  if (direct) return { ...DEFAULT_VISIBILITY, ...direct }
-
-  // 2. Scan tuiConfig.plugin array — works even when plugin loaded via file://
-  //    but options are in a separate tuple entry
-  const plugins = tuiConfig?.plugin
-  if (plugins) {
-    for (const entry of plugins) {
-      if (Array.isArray(entry) && entry.length >= 2) {
-        const [id, opts] = entry
-        if (
-          typeof id === "string" &&
-          (id === PLUGIN_ID || id.includes("opencode-stats-for-nerds"))
-        ) {
-          const extracted = extractShow(opts)
-          if (extracted) return { ...DEFAULT_VISIBILITY, ...extracted }
-        }
-      }
-    }
-  }
-
-  return { ...DEFAULT_VISIBILITY }
+function resolveVisibility(options: unknown): StatVisibility {
+  if (!options || typeof options !== "object") return { ...DEFAULT_VISIBILITY }
+  const show = (options as PluginOptions).show
+  if (!show || typeof show !== "object") return { ...DEFAULT_VISIBILITY }
+  return { ...DEFAULT_VISIBILITY, ...show }
 }
 
 // ── Helpers ──
@@ -101,10 +72,13 @@ function fmtDuration(ms: number): string {
 
 interface FlatPart {
   type: string
-  time?: number | { start?: number; end?: number }
+  time?: { start?: number; end?: number }
+  tool?: string
+  status?: string
 }
 
 interface RawMessage {
+  id?: string
   role: string
   modelID?: string
   providerID?: string
@@ -117,7 +91,6 @@ interface RawMessage {
     cache?: { read?: number; write?: number }
   }
   time?: { created?: number; completed?: number }
-  parts?: FlatPart[]
 }
 
 interface FileChange {
@@ -131,8 +104,7 @@ interface Stats {
   totalInput: number
   totalOutput: number
   totalReasoning: number
-  totalCacheRead: number
-  totalCacheWrite: number
+  totalCached: number
   // context (last message)
   contextUsed: number
   contextLimit: number
@@ -176,9 +148,8 @@ function computeStats(
   sessionCost: number,
   fileChanges: FileChange[],
   contextLimit: number,
+  partsByMessage: Map<string, FlatPart[]>,
 ): Stats | null {
-  // Only count COMPLETED assistant messages (have tokens with output > 0)
-  // This prevents context from going to 0 during generation
   const assistants = messages.filter(
     (m) => m.role === "assistant" && m.tokens && (m.tokens.output || 0) > 0,
   )
@@ -188,8 +159,7 @@ function computeStats(
   let totalInput = 0
   let totalOutput = 0
   let totalReasoning = 0
-  let totalCacheRead = 0
-  let totalCacheWrite = 0
+  let totalCached = 0
   let totalCost = 0
   let activeTimeMs = 0
   let thinkTimeMs = 0
@@ -201,23 +171,21 @@ function computeStats(
     totalInput += tk.input || 0
     totalOutput += tk.output || 0
     totalReasoning += tk.reasoning || 0
-    totalCacheRead += tk.cache?.read || 0
-    totalCacheWrite += tk.cache?.write || 0
+    totalCached += (tk.cache?.read || 0) + (tk.cache?.write || 0)
     totalCost += m.cost || 0
 
     if (m.time?.created && m.time?.completed) {
       activeTimeMs += m.time.completed - m.time.created
     }
 
-    if (m.parts) {
-      for (const p of m.parts) {
-        if (p.type === "step-start") stepCount++
-        if (p.type === "tool") toolCallCount++
-        if (p.type === "reasoning") {
-          const t = p.time
-          if (t && typeof t === "object" && t.start && t.end) {
-            thinkTimeMs += t.end - t.start
-          }
+    // Parts are fetched separately via api.state.part(messageID)
+    const parts = m.id ? partsByMessage.get(m.id) || [] : []
+    for (const p of parts) {
+      if (p.type === "step-start") stepCount++
+      if (p.type === "tool") toolCallCount++
+      if (p.type === "reasoning") {
+        if (p.time?.start && p.time?.end) {
+          thinkTimeMs += p.time.end - p.time.start
         }
       }
     }
@@ -232,18 +200,16 @@ function computeStats(
 
   const contextPercent = contextLimit > 0 ? Math.round((contextUsed / contextLimit) * 100) : 0
 
-  // TTFT
+  // TTFT — find first text or reasoning part's start time
   let lastTtft: number | null = null
-  if (last.time?.created && last.parts) {
-    for (const p of last.parts) {
-      if ((p.type === "text" || p.type === "reasoning") && p.time) {
-        const t = typeof p.time === "number" ? p.time : p.time.start
-        if (t) {
-          const delta = t - last.time.created
-          if (delta > 0) {
-            lastTtft = delta / 1000
-            break
-          }
+  if (last.id && last.time?.created) {
+    const lastParts = partsByMessage.get(last.id) || []
+    for (const p of lastParts) {
+      if ((p.type === "text" || p.type === "reasoning") && p.time?.start) {
+        const delta = p.time.start - last.time.created
+        if (delta > 0) {
+          lastTtft = delta / 1000
+          break
         }
       }
     }
@@ -270,8 +236,7 @@ function computeStats(
     totalInput,
     totalOutput,
     totalReasoning,
-    totalCacheRead,
-    totalCacheWrite,
+    totalCached,
     contextUsed,
     contextLimit,
     contextPercent,
@@ -310,15 +275,18 @@ function StatsView(props: {
     if (e.properties?.sessionID !== props.sessionID) return
     setTick((v: number) => v + 1)
   })
+  const stop3 = props.api.event.on("message.part.updated", (e: any) => {
+    if (e.properties?.sessionID !== props.sessionID) return
+    setTick((v: number) => v + 1)
+  })
 
-  onCleanup(() => { stop1(); stop2() })
+  onCleanup(() => { stop1(); stop2(); stop3() })
 
   // Cache last good stats so sidebar doesn't blank out during generation
   let cached: Stats | null = null
   const isGenerating = createMemo(() => {
     tick()
     const msgs = props.api.state.session.messages(props.sessionID) as unknown as RawMessage[] || []
-    // Check if the last assistant message is incomplete (no output tokens yet)
     const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant")
     if (!lastAssistant) return false
     const tk = lastAssistant.tokens
@@ -337,7 +305,23 @@ function StatsView(props: {
     }
 
     const diff = props.api.state.session.diff(props.sessionID) as unknown as FileChange[] || []
-    const result = computeStats(msgs, session?.cost ?? 0, diff, ctxLimit)
+
+    // Fetch parts for each assistant message via the separate API
+    const partsByMessage = new Map<string, FlatPart[]>()
+    for (const m of msgs) {
+      if (m.role === "assistant" && m.id) {
+        try {
+          const parts = props.api.state.part(m.id) as unknown as FlatPart[]
+          if (parts && parts.length > 0) {
+            partsByMessage.set(m.id, parts)
+          }
+        } catch {
+          // part() may not be available for all messages
+        }
+      }
+    }
+
+    const result = computeStats(msgs, session?.cost ?? 0, diff, ctxLimit, partsByMessage)
     if (result) cached = result
     return result
   })
@@ -356,7 +340,7 @@ function StatsView(props: {
 
   return (
     <box flexDirection="column" paddingTop={1} paddingBottom={1}>
-      <box flexDirection="row" gap={1} onMouseDown={() => setCollapsed((c) => !c)}>
+      <box flexDirection="row" gap={1} onMouseDown={() => setCollapsed((c: boolean) => !c)}>
         <text style={{ fg: t().textMuted }}>{collapsed() ? "\u25B6" : "\u25BC"}</text>
         <text style={{ fg: t().text, fontWeight: "bold" }}>Stats for Nerds</text>
         <Show when={isGenerating()}>
@@ -390,19 +374,11 @@ function StatsView(props: {
                 </Show>
               </Show>
 
-              {/* ── Cache ── */}
-              <Show when={v.cache && (s().totalCacheRead > 0 || s().totalCacheWrite > 0)}>
+              {/* ── Cache (merged read + write) ── */}
+              <Show when={v.cache && s().totalCached > 0}>
                 <box flexDirection="row">
                   <text style={{ fg: t().textMuted }}>{L + "Cached" + GAP}</text>
-                  <text style={{ fg: t().text }}>
-                    {fmt(s().totalCacheRead) + " read"}
-                  </text>
-                  <Show when={s().totalCacheWrite > 0}>
-                    <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                    <text style={{ fg: t().text }}>
-                      {fmt(s().totalCacheWrite) + " write"}
-                    </text>
-                  </Show>
+                  <text style={{ fg: t().text }}>{fmt(s().totalCached)}</text>
                 </box>
               </Show>
 
@@ -523,7 +499,7 @@ function StatsView(props: {
 // ── Plugin ──
 
 const tui: TuiPlugin = async (api, options) => {
-  const visibility = resolveVisibility(options, api.tuiConfig as any)
+  const visibility = resolveVisibility(options)
 
   api.slots.register({
     order: 200,
