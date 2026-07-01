@@ -1,7 +1,7 @@
 {
   "name": "oc-stats-for-nerds",
   "version": "1.0.0",
-  "description": "Shows token/speed/cost stats — live sidebar widget + final stats after agent finishes",
+  "description": "OpenCode TUI plugin — token usage, speed, and cost stats in the sidebar",
   "author": "imluckii",
   "license": "MIT",
   "type": "module",
@@ -10,22 +10,21 @@
     "type": "git",
     "url": "git+https://github.com/imluckii/oc-stats-for-nerds.git"
   },
-  "keywords": ["opencode", "opencode-plugin", "stats", "tokens", "paseo", "tui", "sidebar"],
+  "homepage": "https://github.com/imluckii/oc-stats-for-nerds#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "stats",
+    "tokens",
+    "tui",
+    "sidebar"
+  ],
   "exports": {
-    ".": {
-      "import": "./tui.tsx"
-    },
-    "./tui": {
-      "import": "./tui.tsx"
-    },
-    "./server": {
-      "import": "./server.ts"
-    }
+    ".": { "import": "./tui.tsx" },
+    "./tui": { "import": "./tui.tsx" }
   },
   "files": [
     "tui.tsx",
-    "server.ts",
-    "watcher.mjs",
     "README.md",
     "LICENSE"
   ],
