@@ -38,6 +38,13 @@ const DEFAULT_VISIBILITY: StatVisibility = {
   model: true,
 }
 
+function resolveVisibility(options: unknown): StatVisibility {
+  if (!options || typeof options !== "object") return { ...DEFAULT_VISIBILITY }
+  const show = (options as PluginOptions).show
+  if (!show || typeof show !== "object") return { ...DEFAULT_VISIBILITY }
+  return { ...DEFAULT_VISIBILITY, ...show }
+}
+
 // ── Helpers ──
 
 function fmt(n: number): string {
@@ -61,18 +68,14 @@ function fmtDuration(ms: number): string {
   return `${m}m ${rem}s`
 }
 
-function pad(str: string, width: number): string {
-  const s = String(str)
-  return s.length >= width ? s : s + " ".repeat(width - s.length)
-}
-
 // ── Types ──
 
-// The TUI state API (api.state.session.messages) returns FLAT message objects.
-// Fields are directly on the message: { role, tokens, modelID, cost, ... }
-// NOT wrapped in { info: {...}, parts: [...] } like the HTTP API.
+interface FlatPart {
+  type: string
+  time?: number | { start?: number; end?: number }
+}
 
-interface FlatMessage {
+interface RawMessage {
   role: string
   modelID?: string
   providerID?: string
@@ -85,14 +88,6 @@ interface FlatMessage {
     cache?: { read?: number; write?: number }
   }
   time?: { created?: number; completed?: number }
-}
-
-interface FlatPart {
-  type: string
-  time?: number | { start?: number; end?: number }
-}
-
-interface RawMessage extends FlatMessage {
   parts?: FlatPart[]
 }
 
@@ -103,13 +98,13 @@ interface FileChange {
 }
 
 interface Stats {
-  // cumulative tokens
+  // cumulative
   totalInput: number
   totalOutput: number
   totalReasoning: number
   totalCacheRead: number
   totalCacheWrite: number
-  // context window (last message, NOT cumulative)
+  // context (last message)
   contextUsed: number
   contextLimit: number
   contextPercent: number
@@ -153,11 +148,21 @@ function computeStats(
   fileChanges: FileChange[],
   contextLimit: number,
 ): Stats | null {
-  const assistants = messages
-    .filter((m) => m.role === "assistant" && m.tokens)
-    .map((m) => m)
+  // Only count COMPLETED assistant messages (have tokens with output > 0)
+  // This prevents context from going to 0 during generation
+  const assistants = messages.filter(
+    (m) => m.role === "assistant" && m.tokens && (m.tokens.output || 0) > 0,
+  )
 
-  if (assistants.length === 0) return null
+  if (assistants.length === 0) {
+    // Check if there are any assistant messages at all (even in-progress)
+    const anyAssistant = messages.find((m) => m.role === "assistant")
+    if (anyAssistant) {
+      // In progress — return null to show "generating..."
+      return null
+    }
+    return null
+  }
 
   let totalInput = 0
   let totalOutput = 0
@@ -183,7 +188,6 @@ function computeStats(
       activeTimeMs += m.time.completed - m.time.created
     }
 
-    // Count parts
     if (m.parts) {
       for (const p of m.parts) {
         if (p.type === "step-start") stepCount++
@@ -198,7 +202,7 @@ function computeStats(
     }
   }
 
-  // Context window = last message's full token set
+  // Context = last completed message's full token set
   const last = assistants[assistants.length - 1]
   const lastTk = last.tokens!
   const contextUsed =
@@ -294,15 +298,10 @@ function StatsView(props: {
     const msgs = props.api.state.session.messages(props.sessionID) as unknown as RawMessage[] || []
     const session = props.api.state.session.get(props.sessionID) as any
 
-    // Find model info for context limit
     let ctxLimit = 0
-    const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant")
+    const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant" && m.tokens)
     if (lastAssistant) {
-      ctxLimit = findContextLimit(
-        props.api,
-        lastAssistant.modelID,
-        lastAssistant.providerID,
-      )
+      ctxLimit = findContextLimit(props.api, lastAssistant.modelID, lastAssistant.providerID)
     }
 
     const diff = props.api.state.session.diff(props.sessionID) as unknown as FileChange[] || []
@@ -311,14 +310,8 @@ function StatsView(props: {
 
   const v = props.visibility
   const t = () => theme()
-  const W = 13
-
-  // Context percent color
-  const ctxColor = (pct: number) => {
-    if (pct > 80) return t().error
-    if (pct > 50) return t().warning
-    return t().text
-  }
+  const L = "  " // label indent
+  const GAP = "  " // gap between label and value
 
   return (
     <box flexDirection="column" paddingTop={1} paddingBottom={1}>
@@ -330,33 +323,41 @@ function StatsView(props: {
       <Show when={!collapsed()}>
         <Show
           when={stats()}
-          fallback={<text style={{ fg: t().textMuted }}>{"  waiting..."}</text>}
+          fallback={<text style={{ fg: t().textMuted }}>{L + "waiting..."}</text>}
         >
           {(s) => (
             <box flexDirection="column">
 
-              {/* ── Tokens ── */}
+              {/* ── Tokens — each on its own line to prevent wrapping ── */}
               <Show when={v.tokens}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Tokens", W)}</text>
-                  <text style={{ fg: t().text }}>{"  " + fmt(s().totalInput) + " in"}</text>
-                  <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                  <text style={{ fg: t().text }}>{fmt(s().totalOutput) + " out"}</text>
-                  <Show when={s().totalReasoning > 0}>
-                    <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                    <text style={{ fg: t().text }}>{fmt(s().totalReasoning) + " thinking"}</text>
-                  </Show>
+                  <text style={{ fg: t().textMuted }}>{L + "Input" + GAP}</text>
+                  <text style={{ fg: t().text }}>{fmt(s().totalInput)}</text>
                 </box>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{L + "Output" + GAP}</text>
+                  <text style={{ fg: t().text }}>{fmt(s().totalOutput)}</text>
+                </box>
+                <Show when={s().totalReasoning > 0}>
+                  <box flexDirection="row">
+                    <text style={{ fg: t().textMuted }}>{L + "Thinking" + GAP}</text>
+                    <text style={{ fg: t().text }}>{fmt(s().totalReasoning)}</text>
+                  </box>
+                </Show>
               </Show>
 
               {/* ── Cache ── */}
               <Show when={v.cache && (s().totalCacheRead > 0 || s().totalCacheWrite > 0)}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Cached", W)}</text>
-                  <text style={{ fg: t().text }}>{"  " + fmt(s().totalCacheRead) + " read"}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Cached" + GAP}</text>
+                  <text style={{ fg: t().text }}>
+                    {fmt(s().totalCacheRead) + " read"}
+                  </text>
                   <Show when={s().totalCacheWrite > 0}>
                     <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
-                    <text style={{ fg: t().text }}>{fmt(s().totalCacheWrite) + " write"}</text>
+                    <text style={{ fg: t().text }}>
+                      {fmt(s().totalCacheWrite) + " write"}
+                    </text>
                   </Show>
                 </box>
               </Show>
@@ -364,9 +365,15 @@ function StatsView(props: {
               {/* ── Context ── */}
               <Show when={v.context && s().contextLimit > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Context", W)}</text>
-                  <text style={{ fg: ctxColor(s().contextPercent) }}>
-                    {"  " + fmt(s().contextUsed) + " / " + fmt(s().contextLimit)}
+                  <text style={{ fg: t().textMuted }}>{L + "Context" + GAP}</text>
+                  <text
+                    style={{
+                      fg: s().contextPercent > 80 ? t().error
+                        : s().contextPercent > 50 ? t().warning
+                        : t().text,
+                    }}
+                  >
+                    {fmt(s().contextUsed) + " / " + fmt(s().contextLimit)}
                   </text>
                   <text style={{ fg: t().textMuted }}>
                     {" (" + s().contextPercent + "%)"}
@@ -375,64 +382,64 @@ function StatsView(props: {
               </Show>
 
               {/* ── Separator ── */}
-              <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
+              <text style={{ fg: t().textMuted }}>{L + "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
 
               {/* ── Cost ── */}
               <Show when={v.cost}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Cost", W)}</text>
-                  <text style={{ fg: t().text }}>{"  $" + s().totalCost.toFixed(4)}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Cost" + GAP}</text>
+                  <text style={{ fg: t().text }}>{"$" + s().totalCost.toFixed(4)}</text>
                 </box>
               </Show>
 
               {/* ── Gen Time ── */}
               <Show when={v.genTime && s().activeTimeMs > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Gen Time", W)}</text>
-                  <text style={{ fg: t().text }}>{"  " + fmtDuration(s().activeTimeMs)}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Gen Time" + GAP}</text>
+                  <text style={{ fg: t().text }}>{fmtDuration(s().activeTimeMs)}</text>
                 </box>
               </Show>
 
               {/* ── Think Time ── */}
               <Show when={v.thinkTime && s().thinkTimeMs > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Think Time", W)}</text>
-                  <text style={{ fg: t().text }}>{"  " + fmtDuration(s().thinkTimeMs)}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Think Time" + GAP}</text>
+                  <text style={{ fg: t().text }}>{fmtDuration(s().thinkTimeMs)}</text>
                 </box>
               </Show>
 
               {/* ── TTFT ── */}
               <Show when={v.ttft && s().lastTtft !== null}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  TTFT", W)}</text>
-                  <text style={{ fg: t().text }}>{"  " + s().lastTtft!.toFixed(2) + "s"}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "TTFT" + GAP}</text>
+                  <text style={{ fg: t().text }}>{s().lastTtft!.toFixed(2) + "s"}</text>
                 </box>
               </Show>
 
               {/* ── Speed ── */}
               <Show when={v.speed && s().lastTps > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Speed", W)}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Speed" + GAP}</text>
                   <text
                     style={{
-                      fg: s().lastTps > 50 ? t().success : s().lastTps > 15 ? t().warning : t().textMuted,
+                      fg: s().lastTps > 50 ? t().success
+                        : s().lastTps > 15 ? t().warning
+                        : t().textMuted,
                     }}
                   >
-                    {"  " + fmtTps(s().lastTps) + " tok/s"}
+                    {fmtTps(s().lastTps) + " tok/s"}
                   </text>
                 </box>
               </Show>
 
               {/* ── Separator ── */}
-              <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
+              <text style={{ fg: t().textMuted }}>{L + "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
 
               {/* ── Activity ── */}
               <Show when={v.activity && (s().stepCount > 0 || s().toolCallCount > 0)}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Activity", W)}</text>
-                  <text style={{ fg: t().text }}>
-                    {"  " + s().stepCount + " steps"}
-                  </text>
+                  <text style={{ fg: t().textMuted }}>{L + "Activity" + GAP}</text>
+                  <text style={{ fg: t().text }}>{s().stepCount + " steps"}</text>
                   <Show when={s().toolCallCount > 0}>
                     <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
                     <text style={{ fg: t().text }}>{s().toolCallCount + " tools"}</text>
@@ -443,8 +450,8 @@ function StatsView(props: {
               {/* ── Changes ── */}
               <Show when={v.changes && s().fileChanges.length > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Changes", W)}</text>
-                  <text style={{ fg: t().success }}>{"  +" + s().totalAdditions}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Changes" + GAP}</text>
+                  <text style={{ fg: t().success }}>{"+" + s().totalAdditions}</text>
                   <text style={{ fg: t().textMuted }}>{" "}</text>
                   <text style={{ fg: t().error }}>{"-" + s().totalDeletions}</text>
                   <text style={{ fg: t().textMuted }}>
@@ -456,8 +463,8 @@ function StatsView(props: {
               {/* ── Model ── */}
               <Show when={v.model}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Model", W)}</text>
-                  <text style={{ fg: t().textMuted }}>{"  " + s().model}</text>
+                  <text style={{ fg: t().textMuted }}>{L + "Model" + GAP}</text>
+                  <text style={{ fg: t().textMuted }}>{s().model}</text>
                 </box>
               </Show>
 
@@ -472,11 +479,7 @@ function StatsView(props: {
 // ── Plugin ──
 
 const tui: TuiPlugin = async (api, options) => {
-  const opts = options as PluginOptions | undefined
-  const visibility: StatVisibility = {
-    ...DEFAULT_VISIBILITY,
-    ...opts?.show,
-  }
+  const visibility = resolveVisibility(options)
 
   api.slots.register({
     order: 200,
