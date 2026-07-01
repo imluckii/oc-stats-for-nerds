@@ -104,7 +104,8 @@ interface Stats {
   totalInput: number
   totalOutput: number
   totalReasoning: number
-  totalCached: number
+  // last-turn cache (how much of current context is cached)
+  lastCached: number
   // context (last message)
   contextUsed: number
   contextLimit: number
@@ -159,7 +160,6 @@ function computeStats(
   let totalInput = 0
   let totalOutput = 0
   let totalReasoning = 0
-  let totalCached = 0
   let totalCost = 0
   let activeTimeMs = 0
   let thinkTimeMs = 0
@@ -171,7 +171,6 @@ function computeStats(
     totalInput += tk.input || 0
     totalOutput += tk.output || 0
     totalReasoning += tk.reasoning || 0
-    totalCached += (tk.cache?.read || 0) + (tk.cache?.write || 0)
     totalCost += m.cost || 0
 
     if (m.time?.created && m.time?.completed) {
@@ -232,11 +231,14 @@ function computeStats(
     totalDeletions += f.deletions || 0
   }
 
+  // Last-turn cache (how much of current context is cached)
+  const lastCached = (lastTk.cache?.read || 0) + (lastTk.cache?.write || 0)
+
   return {
     totalInput,
     totalOutput,
     totalReasoning,
-    totalCached,
+    lastCached,
     contextUsed,
     contextLimit,
     contextPercent,
@@ -375,10 +377,10 @@ function StatsView(props: {
               </Show>
 
               {/* ── Cache (merged read + write) ── */}
-              <Show when={v.cache && s().totalCached > 0}>
+              <Show when={v.cache && s().lastCached > 0}>
                 <box flexDirection="row">
                   <text style={{ fg: t().textMuted }}>{L + "Cached" + GAP}</text>
-                  <text style={{ fg: t().text }}>{fmt(s().totalCached)}</text>
+                  <text style={{ fg: t().text }}>{fmt(s().lastCached)}</text>
                 </box>
               </Show>
 
