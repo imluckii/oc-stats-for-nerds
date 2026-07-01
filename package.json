@@ -1,20 +1,22 @@
 {
   "name": "oc-stats-for-nerds",
-  "version": "1.0.0",
-  "description": "Shows token/speed/cost stats when an OpenCode session finishes",
+  "version": "2.0.0",
+  "description": "Shows token/speed/cost stats — live sidebar widget + final stats after agent finishes",
   "author": "imluckii",
   "license": "MIT",
+  "type": "module",
   "repository": {
     "type": "git",
     "url": "https://github.com/imluckii/oc-stats-for-nerds.git"
   },
-  "keywords": ["opencode", "opencode-plugin", "stats", "tokens", "paseo"],
-  "type": "module",
-  "bin": {
-    "oc-stats-for-nerds": "./watcher.mjs"
+  "keywords": ["opencode", "opencode-plugin", "stats", "tokens", "paseo", "tui"],
+  "exports": {
+    "./server": "./server.ts",
+    "./tui": "./tui.ts"
   },
   "files": [
-    "index.ts",
+    "server.ts",
+    "tui.ts",
     "watcher.mjs",
     "README.md",
     "LICENSE"
