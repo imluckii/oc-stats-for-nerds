@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createSignal, Show, onCleanup, createMemo, For } from "solid-js"
+import { createSignal, Show, onCleanup, createMemo } from "solid-js"
 
 const PLUGIN_ID = "oc-stats-for-nerds"
 
@@ -13,23 +13,10 @@ function fmt(n: number): string {
   return String(n)
 }
 
-function fmtCost(n: number): string {
-  if (n === 0) return "$0.00"
-  if (n < 0.01) return "$" + n.toFixed(4)
-  return "$" + n.toFixed(2)
-}
-
 function fmtTps(n: number): string {
   if (n >= 100) return n.toFixed(0)
   if (n >= 10) return n.toFixed(1)
   return n.toFixed(2)
-}
-
-function fmtDur(ms: number): string {
-  const s = ms / 1000
-  if (s < 60) return `${s.toFixed(1)}s`
-  const m = Math.floor(s / 60)
-  return `${m}m ${Math.floor(s % 60)}s`
 }
 
 function pad(str: string, width: number): string {
@@ -37,89 +24,116 @@ function pad(str: string, width: number): string {
   return s.length >= width ? s : s + " ".repeat(width - s.length)
 }
 
-// ── Stats computation ──
+// ── Types ──
 
-interface TurnStats {
-  // last response stats
-  lastInput: number
-  lastOutput: number
-  lastReasoning: number
-  lastCacheRead: number
-  lastCacheWrite: number
-  lastContext: number
-  lastCost: number
-  lastModel: string
-  lastDurationMs: number
-  lastTps: number
-  // session totals
-  totalOutput: number
-  totalCost: number
-  turnCount: number
+interface PartData {
+  type: string
+  time?: number
+}
+
+interface MessageInfo {
+  role: string
+  modelID?: string
+  cost?: number
+  tokens?: {
+    total?: number
+    input?: number
+    output?: number
+    reasoning?: number
+    cache?: { read?: number; write?: number }
+  }
+  time?: { created?: number; completed?: number }
 }
 
 interface RawMessage {
-  info: {
-    role: string
-    modelID?: string
-    providerID?: string
-    cost?: number
-    tokens?: {
-      total?: number
-      input?: number
-      output?: number
-      reasoning?: number
-      cache?: { read?: number; write?: number }
-    }
-    time?: { created?: number; completed?: number }
-  }
+  info: MessageInfo
+  parts?: PartData[]
 }
 
-function computeTurnStats(messages: RawMessage[], sessionCost: number): TurnStats | null {
+interface Stats {
+  // cumulative across all assistant turns
+  totalInput: number
+  totalOutput: number
+  totalReasoning: number
+  totalCacheRead: number
+  totalCacheWrite: number
+  grandTotal: number
+  totalCost: number
+  turnCount: number
+  model: string
+  // latest turn only
+  lastTtft: number | null
+  lastTps: number
+}
+
+function computeStats(messages: RawMessage[], sessionCost: number): Stats | null {
   const assistants = messages
     .filter((m) => m.info?.role === "assistant" && m.info?.tokens)
-    .map((m) => m.info)
+    .map((m) => m)
 
   if (assistants.length === 0) return null
 
+  // Cumulative totals
+  let totalInput = 0
+  let totalOutput = 0
+  let totalReasoning = 0
+  let totalCacheRead = 0
+  let totalCacheWrite = 0
+  let totalCost = 0
+
+  for (const m of assistants) {
+    const tk = m.info.tokens!
+    totalInput += tk.input || 0
+    totalOutput += tk.output || 0
+    totalReasoning += tk.reasoning || 0
+    totalCacheRead += tk.cache?.read || 0
+    totalCacheWrite += tk.cache?.write || 0
+    totalCost += m.info.cost || 0
+  }
+
+  // Latest turn for TTFT and speed
   const last = assistants[assistants.length - 1]
-  const tk = last.tokens!
+  const lastInfo = last.info
+  const lastTk = lastInfo.tokens!
 
-  const lastContext =
-    (tk.input || 0) + (tk.output || 0) + (tk.reasoning || 0) +
-    (tk.cache?.read || 0) + (tk.cache?.write || 0)
-
-  // Duration and TPS from timestamps
-  let lastDurationMs = 0
-  let lastTps = 0
-  if (last.time?.created && last.time?.completed) {
-    lastDurationMs = last.time.completed - last.time.created
-    if (lastDurationMs > 0) {
-      lastTps = (tk.output || 0) / (lastDurationMs / 1000)
+  // TTFT: time from message created to first content part emitted
+  let lastTtft: number | null = null
+  if (lastInfo.time?.created && last.parts) {
+    for (const p of last.parts) {
+      if ((p.type === "text" || p.type === "reasoning") && p.time) {
+        const delta = p.time - lastInfo.time.created
+        if (delta > 0) {
+          lastTtft = delta / 1000
+          break
+        }
+      }
     }
   }
 
-  // Session totals
-  let totalOutput = 0
-  let totalCost = 0
-  for (const m of assistants) {
-    totalOutput += m.tokens?.output || 0
-    totalCost += m.cost || 0
+  // Speed: output tokens / generation duration
+  let lastTps = 0
+  if (lastInfo.time?.created && lastInfo.time?.completed) {
+    const durSec = (lastInfo.time.completed - lastInfo.time.created) / 1000
+    if (durSec > 0) {
+      lastTps = (lastTk.output || 0) / durSec
+    }
   }
 
+  const grandTotal =
+    totalInput + totalOutput + totalReasoning + totalCacheRead + totalCacheWrite
+
   return {
-    lastInput: tk.input || 0,
-    lastOutput: tk.output || 0,
-    lastReasoning: tk.reasoning || 0,
-    lastCacheRead: tk.cache?.read || 0,
-    lastCacheWrite: tk.cache?.write || 0,
-    lastContext,
-    lastCost: last.cost || 0,
-    lastModel: last.modelID || "unknown",
-    lastDurationMs,
-    lastTps,
+    totalInput,
     totalOutput,
+    totalReasoning,
+    totalCacheRead,
+    totalCacheWrite,
+    grandTotal,
     totalCost: sessionCost || totalCost,
     turnCount: assistants.length,
+    model: lastInfo.modelID || "unknown",
+    lastTtft,
+    lastTps,
   }
 }
 
@@ -127,132 +141,129 @@ function computeTurnStats(messages: RawMessage[], sessionCost: number): TurnStat
 
 function StatsView(props: { api: Parameters<TuiPlugin>[0]; sessionID: string }) {
   const theme = () => props.api.theme.current
-
   const [collapsed, setCollapsed] = createSignal(false)
-  const [version, setVersion] = createSignal(0)
-  const bump = () => setVersion((v) => v + 1)
+  const [tick, setTick] = createSignal(0)
 
-  // Event subscriptions
-  const stop1 = props.api.event.on("message.updated", (e) => {
-    if ((e.properties as any).sessionID !== props.sessionID) return
-    bump()
+  const stop1 = props.api.event.on("message.updated", (e: any) => {
+    if (e.properties?.sessionID !== props.sessionID) return
+    setTick((v) => v + 1)
   })
-  const stop2 = props.api.event.on("message.part.updated", (e) => {
-    if ((e.properties as any).sessionID !== props.sessionID) return
-    bump()
-  })
-  const stop3 = props.api.event.on("session.idle", (e) => {
-    const sid = (e.properties as any).id || (e.properties as any).sessionID
+  const stop2 = props.api.event.on("session.idle", (e: any) => {
+    const sid = e.properties?.id || e.properties?.sessionID
     if (sid !== props.sessionID) return
-    bump()
+    setTick((v) => v + 1)
   })
 
-  onCleanup(() => { stop1(); stop2(); stop3() })
+  onCleanup(() => { stop1(); stop2() })
 
-  const stats = createMemo<TurnStats | null>(() => {
-    version() // track
+  const stats = createMemo<Stats | null>(() => {
+    tick()
     const msgs = props.api.state.session.messages(props.sessionID) as unknown as RawMessage[] || []
     const session = props.api.state.session.get(props.sessionID) as any
-    return computeTurnStats(msgs, session?.cost ?? 0)
+    return computeStats(msgs, session?.cost ?? 0)
   })
 
-  const toggle = () => setCollapsed((v) => !v)
   const t = () => theme()
-  const labelW = 11
+  const W = 8
 
   return (
     <box flexDirection="column" paddingTop={1} paddingBottom={1}>
-      {/* Header — click to toggle */}
-      <box
-        flexDirection="row"
-        gap={1}
-        onMouseDown={() => setCollapsed((v) => !v)}
-      >
+      <box flexDirection="row" gap={1} onMouseDown={() => setCollapsed((v) => !v)}>
         <text style={{ fg: t().textMuted }}>{collapsed() ? "\u25B6" : "\u25BC"}</text>
-        <text style={{ fg: t().text }}>Token Stats</text>
+        <text style={{ fg: t().text, fontWeight: "bold" }}>Stats for Nerds</text>
       </box>
 
       <Show when={!collapsed()}>
         <Show
           when={stats()}
-          fallback={
-            <text style={{ fg: t().textMuted }}>{"  waiting for response..."}</text>
-          }
+          fallback={<text style={{ fg: t().textMuted }}>{"  waiting for response..."}</text>}
         >
           {(s) => (
             <box flexDirection="column">
-              {/* ── Last Response ── */}
+
+              {/* ── Tokens (cumulative) ── */}
               <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Context", labelW)}</text>
-                <text style={{ fg: t().text }}>{fmt(s().lastContext)}</text>
-                <Show when={s().lastCacheRead > 0}>
-                  <text style={{ fg: t().textMuted }}>{"  " + fmt(s().lastCacheRead) + " cached"}</text>
+                <text style={{ fg: t().textMuted }}>{pad("  Tokens", W)}</text>
+                <text style={{ fg: t().text }}>
+                  {"  " + fmt(s().totalInput) + " in"}
+                </text>
+                <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
+                <text style={{ fg: t().text }}>
+                  {fmt(s().totalOutput) + " out"}
+                </text>
+                <Show when={s().totalReasoning > 0}>
+                  <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
+                  <text style={{ fg: t().text }}>
+                    {fmt(s().totalReasoning) + " thinking"}
+                  </text>
                 </Show>
               </box>
 
-              <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Input", labelW)}</text>
-                <text style={{ fg: t().text }}>{s().lastInput.toLocaleString()}</text>
-              </box>
-
-              <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Output", labelW)}</text>
-                <text style={{ fg: t().text }}>{s().lastOutput.toLocaleString()}</text>
-              </box>
-
-              <Show when={s().lastReasoning > 0}>
+              {/* ── Cache (cumulative) ── */}
+              <Show when={s().totalCacheRead > 0 || s().totalCacheWrite > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Thinking", labelW)}</text>
-                  <text style={{ fg: t().text }}>{s().lastReasoning.toLocaleString()}</text>
+                  <text style={{ fg: t().textMuted }}>{pad("  Cache", W)}</text>
+                  <text style={{ fg: t().text }}>
+                    {"  " + fmt(s().totalCacheRead) + " read"}
+                  </text>
+                  <Show when={s().totalCacheWrite > 0}>
+                    <text style={{ fg: t().textMuted }}>{" \u00B7 "}</text>
+                    <text style={{ fg: t().text }}>
+                      {fmt(s().totalCacheWrite) + " write"}
+                    </text>
+                  </Show>
                 </box>
               </Show>
+
+              {/* ── Total ── */}
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Total", W)}</text>
+                <text style={{ fg: t().text }}>
+                  {"  " + fmt(s().grandTotal)}
+                </text>
+              </box>
 
               {/* ── Separator ── */}
               <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
 
-              {/* ── Performance ── */}
-              <Show when={s().lastDurationMs > 0}>
+              {/* ── Cost (cumulative) ── */}
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Cost", W)}</text>
+                <text style={{ fg: t().text }}>
+                  {"  $" + s().totalCost.toFixed(4)}
+                </text>
+              </box>
+
+              {/* ── TTFT (latest turn) ── */}
+              <Show when={s().lastTtft !== null}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Duration", labelW)}</text>
-                  <text style={{ fg: t().text }}>{fmtDur(s().lastDurationMs)}</text>
+                  <text style={{ fg: t().textMuted }}>{pad("  TTFT", W)}</text>
+                  <text style={{ fg: t().text }}>
+                    {"  " + s().lastTtft!.toFixed(2) + "s"}
+                  </text>
                 </box>
               </Show>
 
+              {/* ── Speed (latest turn) ── */}
               <Show when={s().lastTps > 0}>
                 <box flexDirection="row">
-                  <text style={{ fg: t().textMuted }}>{pad("  Speed", labelW)}</text>
+                  <text style={{ fg: t().textMuted }}>{pad("  Speed", W)}</text>
                   <text
                     style={{
                       fg: s().lastTps > 50 ? t().success : s().lastTps > 15 ? t().warning : t().textMuted,
                     }}
                   >
-                    {fmtTps(s().lastTps) + " tok/s"}
+                    {"  " + fmtTps(s().lastTps) + " tok/s"}
                   </text>
                 </box>
               </Show>
 
-              {/* ── Session ── */}
-              <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
-
+              {/* ── Model ── */}
               <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Total out", labelW)}</text>
-                <text style={{ fg: t().text }}>{s().totalOutput.toLocaleString()}</text>
+                <text style={{ fg: t().textMuted }}>{pad("  Model", W)}</text>
+                <text style={{ fg: t().textMuted }}>{"  " + s().model}</text>
               </box>
 
-              <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Total cost", labelW)}</text>
-                <text style={{ fg: t().text }}>{fmtCost(s().totalCost)}</text>
-              </box>
-
-              <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Turns", labelW)}</text>
-                <text style={{ fg: t().text }}>{String(s().turnCount)}</text>
-              </box>
-
-              <box flexDirection="row">
-                <text style={{ fg: t().textMuted }}>{pad("  Model", labelW)}</text>
-                <text style={{ fg: t().textMuted }}>{s().lastModel}</text>
-              </box>
             </box>
           )}
         </Show>
