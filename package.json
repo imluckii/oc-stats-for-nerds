@@ -1,5 +1,5 @@
 {
-  "name": "oc-stats-for-nerds",
+  "name": "opencode-stats-for-nerds",
   "version": "1.0.0",
   "description": "OpenCode TUI plugin — token usage, speed, and cost stats in the sidebar",
   "author": "imluckii",
@@ -8,9 +8,9 @@
   "main": "./tui.tsx",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/imluckii/oc-stats-for-nerds.git"
+    "url": "git+https://github.com/imluckii/opencode-stats-for-nerds.git"
   },
-  "homepage": "https://github.com/imluckii/oc-stats-for-nerds#readme",
+  "homepage": "https://github.com/imluckii/opencode-stats-for-nerds#readme",
   "keywords": [
     "opencode",
     "opencode-plugin",
