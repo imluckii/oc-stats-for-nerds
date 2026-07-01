@@ -68,12 +68,11 @@ function pad(str: string, width: number): string {
 
 // ── Types ──
 
-interface PartData {
-  type: string
-  time?: { start?: number; end?: number }
-}
+// The TUI state API (api.state.session.messages) returns FLAT message objects.
+// Fields are directly on the message: { role, tokens, modelID, cost, ... }
+// NOT wrapped in { info: {...}, parts: [...] } like the HTTP API.
 
-interface MessageInfo {
+interface FlatMessage {
   role: string
   modelID?: string
   providerID?: string
@@ -88,9 +87,13 @@ interface MessageInfo {
   time?: { created?: number; completed?: number }
 }
 
-interface RawMessage {
-  info: MessageInfo
-  parts?: PartData[]
+interface FlatPart {
+  type: string
+  time?: number | { start?: number; end?: number }
+}
+
+interface RawMessage extends FlatMessage {
+  parts?: FlatPart[]
 }
 
 interface FileChange {
@@ -151,7 +154,7 @@ function computeStats(
   contextLimit: number,
 ): Stats | null {
   const assistants = messages
-    .filter((m) => m.info?.role === "assistant" && m.info?.tokens)
+    .filter((m) => m.role === "assistant" && m.tokens)
     .map((m) => m)
 
   if (assistants.length === 0) return null
@@ -168,16 +171,16 @@ function computeStats(
   let toolCallCount = 0
 
   for (const m of assistants) {
-    const tk = m.info.tokens!
+    const tk = m.tokens!
     totalInput += tk.input || 0
     totalOutput += tk.output || 0
     totalReasoning += tk.reasoning || 0
     totalCacheRead += tk.cache?.read || 0
     totalCacheWrite += tk.cache?.write || 0
-    totalCost += m.info.cost || 0
+    totalCost += m.cost || 0
 
-    if (m.info.time?.created && m.info.time?.completed) {
-      activeTimeMs += m.info.time.completed - m.info.time.created
+    if (m.time?.created && m.time?.completed) {
+      activeTimeMs += m.time.completed - m.time.created
     }
 
     // Count parts
@@ -185,8 +188,11 @@ function computeStats(
       for (const p of m.parts) {
         if (p.type === "step-start") stepCount++
         if (p.type === "tool") toolCallCount++
-        if (p.type === "reasoning" && p.time?.start && p.time?.end) {
-          thinkTimeMs += p.time.end - p.time.start
+        if (p.type === "reasoning") {
+          const t = p.time
+          if (t && typeof t === "object" && t.start && t.end) {
+            thinkTimeMs += t.end - t.start
+          }
         }
       }
     }
@@ -194,8 +200,7 @@ function computeStats(
 
   // Context window = last message's full token set
   const last = assistants[assistants.length - 1]
-  const lastInfo = last.info
-  const lastTk = lastInfo.tokens!
+  const lastTk = last.tokens!
   const contextUsed =
     (lastTk.input || 0) + (lastTk.output || 0) + (lastTk.reasoning || 0) +
     (lastTk.cache?.read || 0) + (lastTk.cache?.write || 0)
@@ -204,12 +209,12 @@ function computeStats(
 
   // TTFT
   let lastTtft: number | null = null
-  if (lastInfo.time?.created && last.parts) {
+  if (last.time?.created && last.parts) {
     for (const p of last.parts) {
       if ((p.type === "text" || p.type === "reasoning") && p.time) {
-        const t = p.time.start || (p.time as any)
-        if (typeof t === "number") {
-          const delta = t - lastInfo.time.created
+        const t = typeof p.time === "number" ? p.time : p.time.start
+        if (t) {
+          const delta = t - last.time.created
           if (delta > 0) {
             lastTtft = delta / 1000
             break
@@ -221,8 +226,8 @@ function computeStats(
 
   // Speed
   let lastTps = 0
-  if (lastInfo.time?.created && lastInfo.time?.completed) {
-    const durSec = (lastInfo.time.completed - lastInfo.time.created) / 1000
+  if (last.time?.created && last.time?.completed) {
+    const durSec = (last.time.completed - last.time.created) / 1000
     if (durSec > 0) {
       lastTps = (lastTk.output || 0) / durSec
     }
@@ -255,8 +260,8 @@ function computeStats(
     fileChanges,
     totalAdditions,
     totalDeletions,
-    model: lastInfo.modelID || "unknown",
-    providerID: lastInfo.providerID || "",
+    model: last.modelID || "unknown",
+    providerID: last.providerID || "",
     turnCount: assistants.length,
   }
 }
@@ -291,12 +296,12 @@ function StatsView(props: {
 
     // Find model info for context limit
     let ctxLimit = 0
-    const lastAssistant = [...msgs].reverse().find((m) => m.info?.role === "assistant")
+    const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant")
     if (lastAssistant) {
       ctxLimit = findContextLimit(
         props.api,
-        lastAssistant.info.modelID,
-        lastAssistant.info.providerID,
+        lastAssistant.modelID,
+        lastAssistant.providerID,
       )
     }
 
